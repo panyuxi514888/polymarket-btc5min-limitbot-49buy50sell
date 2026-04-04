@@ -14,6 +14,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use log::{warn, info, error, debug};
 use futures::StreamExt;
+use polymarket_client_sdk::clob::ws::types::response::TradeMessageStatus;
 
 const MARKET_DURATION_SECS: i64 = 300;
 const MARKET_DURATION_SECS_U64: u64 = 300;
@@ -105,15 +106,24 @@ impl PreLimitStrategy {
         
         // Initialize CLOB subscription if client is available
         if let Some(clob_client) = &self.clob_client {
-            info!("Starting CLOB order status subscription");
-            
+            info!("Starting CLOB order and trade status subscription (event-driven SELL placement)");
+
             let clob_client_clone = clob_client.clone();
             let state_clone = self.state.clone();
+            let api_clone = self.api.clone();
+            let config_clone = self.config.clone();
             let shutdown_token_clone = shutdown_token.clone();
-            
+
             // Spawn task to handle CLOB subscription directly with shutdown support
+            // This now handles both Order and Trade events for event-driven SELL placement
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_clob_subscription_direct(clob_client_clone, state_clone, shutdown_token_clone).await {
+                if let Err(e) = Self::handle_clob_subscription_direct(
+                    clob_client_clone,
+                    state_clone,
+                    api_clone,
+                    config_clone,
+                    shutdown_token_clone
+                ).await {
                     error!("CLOB subscription error: {}", e);
                 }
             });
@@ -159,12 +169,13 @@ impl PreLimitStrategy {
         match state {
             Some(mut s) => {
                 if current_time_et > s.expiry {
-                    if s.up_matched || s.down_matched {
+                    // Only register for redemption if trade was actually mined (tokens received)
+                    if s.up_mined || s.down_mined {
                         let trade = Self::cycle_trade_from_state(&s, self.config.strategy.shares);
                         let mut t = self.trades.lock().await;
                         t.insert(s.condition_id.clone(), trade);
-                        info!("Market expired. Registered position for redemption (condition: {})", 
-                            &s.condition_id[..s.condition_id.len().min(20)]);
+                        info!("Market expired. Registered position for redemption (condition: {}, up_mined: {}, down_mined: {})",
+                            &s.condition_id[..s.condition_id.len().min(20)], s.up_mined, s.down_mined);
                     }
                     *state_guard = None;
                     return Ok(());
@@ -172,16 +183,21 @@ impl PreLimitStrategy {
                 
                 self.check_buy_order_matches(&mut s).await?;
                 
-                if (s.up_matched || s.down_matched) && s.up_sell_order_id.is_none() && s.down_sell_order_id.is_none() {
-                    if s.up_matched {
+                // Event-driven SELL placement is now handled in handle_clob_subscription_direct()
+                // when TradeMessageStatus::Mined is received. This block serves as a fallback
+                // in case the WebSocket event was missed.
+                if (s.up_mined || s.down_mined) && s.up_sell_order_id.is_none() && s.down_sell_order_id.is_none() {
+                    if s.up_mined && s.up_sell_order_id.is_none() {
+                        info!("Fallback: Up trade mined but SELL not placed. Placing now...");
                         let sell_order = self.place_limit_order(&s.up_token_id, "SELL", SELL_PRICE).await?;
                         s.up_sell_order_id = Some(sell_order.order_id.unwrap_or_default());
-                        info!("Up buy filled. Placed SELL order at ${:.2}", SELL_PRICE);
+                        info!("Up buy mined. Placed SELL order at ${:.2}", SELL_PRICE);
                     }
-                    if s.down_matched {
+                    if s.down_mined && s.down_sell_order_id.is_none() {
+                        info!("Fallback: Down trade mined but SELL not placed. Placing now...");
                         let sell_order = self.place_limit_order(&s.down_token_id, "SELL", SELL_PRICE).await?;
                         s.down_sell_order_id = Some(sell_order.order_id.unwrap_or_default());
-                        info!("Down buy filled. Placed SELL order at ${:.2}", SELL_PRICE);
+                        info!("Down buy mined. Placed SELL order at ${:.2}", SELL_PRICE);
                     }
                 }
                 
@@ -207,6 +223,10 @@ impl PreLimitStrategy {
                             down_buy_price: BUY_PRICE,
                             up_matched: false,
                             down_matched: false,
+                            up_mined: false,
+                            down_mined: false,
+                            up_shares_received: 0.0,
+                            down_shares_received: 0.0,
                             up_sell_order_id: None,
                             down_sell_order_id: None,
                             expiry: next_period_start,
@@ -223,26 +243,29 @@ impl PreLimitStrategy {
     }
 
     /// Handle CLOB subscription and send order updates to the strategy
-   pub async fn handle_clob_subscription_direct(
+    /// Now also handles Trade events for event-driven SELL order placement
+    pub async fn handle_clob_subscription_direct(
         clob_client: Arc<ClobClient>,
         state: Arc<Mutex<Option<PreLimitOrderState>>>,
+        api: Arc<PolymarketApi>,
+        config: Config,
         shutdown_token: CancellationToken,
     ) -> Result<()> {
         // Subscribe to user events using empty market list for all events
         let markets = Vec::new();
-        
+
         // Get the authenticated client
         let client = {
             let auth_client: tokio::sync::RwLockReadGuard<Option<polymarket_client_sdk::clob::ws::Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>> = clob_client.authenticated_client.read().await;
             auth_client.clone().ok_or_else(|| anyhow::anyhow!("No authenticated client available"))?
         };
-        
+
         // Subscribe to user events
         let stream = client.subscribe_user_events(markets)?;
         let mut stream = std::pin::pin!(stream);
-        
-        info!("CLOB subscription started, listening for order status updates");
-        
+
+        info!("CLOB subscription started, listening for order and trade status updates");
+
         loop {
             tokio::select! {
                 Some(event) = stream.next() => {
@@ -250,41 +273,142 @@ impl PreLimitStrategy {
                         Ok(user_event) => {
                             match user_event {
                                 polymarket_client_sdk::clob::ws::WsMessage::Order(order) => {
-                                    
                                     info!("Received order update: {:?}", order);
 
                                     if let Some(order_status) = &order.status {
                                         match order_status {
                                             polymarket_client_sdk::clob::types::OrderStatusType::Matched => {
                                                 if let (Some(size_matched), Some(outcome)) = (&order.size_matched, &order.outcome) {
-                                                    // Parse size matched
-                                                    // TODO：这里将来需要根据size_matched来决定如何更新state状态，比如只买入了部分shares如何处理等
-                                                    let _size: f64 = size_matched.to_string().parse::<f64>().unwrap_or(0.0);
-                                                    
-                                                    // Directly update strategy state
+                                                    let size: f64 = size_matched.to_string().parse::<f64>().unwrap_or(0.0);
+
+                                                    // Update matched state (but NOT mined yet - don't place SELL)
                                                     let mut state_guard = state.lock().await;
-                                                    if let Some(mut state) = state_guard.clone() {
+                                                    if let Some(mut s) = state_guard.clone() {
                                                         if outcome.to_lowercase() == "up" {
-                                                            state.up_matched = true;
-                                                            info!("Updated state: up_matched = true");
+                                                            s.up_matched = true;
+                                                            info!("Order MATCHED: up_matched = true (size: {}). Waiting for MINED status before placing SELL.", size);
                                                         } else if outcome.to_lowercase() == "down" {
-                                                            state.down_matched = true;
-                                                            info!("Updated state: down_matched = true");
+                                                            s.down_matched = true;
+                                                            info!("Order MATCHED: down_matched = true (size: {}). Waiting for MINED status before placing SELL.", size);
                                                         }
-                                                        
-                                                        // Update the state in the mutex
-                                                        *state_guard = Some(state);
+                                                        *state_guard = Some(s);
                                                     }
                                                 }
                                             }
                                             _ => {
-                                                debug!("Order status not matched: {:?}", order_status);
+                                                debug!("Order status: {:?}", order_status);
                                             }
                                         }
                                     }
                                 }
+                                polymarket_client_sdk::clob::ws::WsMessage::Trade(trade) => {
+                                    info!("Received trade update: id={}, status={:?}, side={:?}, size={}, price={}",
+                                        trade.id, trade.status, trade.side, trade.size, trade.price);
+
+                                    // Handle trade status updates for event-driven SELL placement
+                                    match trade.status {
+                                        TradeMessageStatus::Mined | TradeMessageStatus::Confirmed => {
+                                            // Trade is now on-chain - tokens are in our account!
+                                            // This is the critical moment to place the SELL order
+
+                                            let trade_size: f64 = trade.size.to_string().parse::<f64>().unwrap_or(0.0);
+                                            let outcome = trade.outcome.as_deref().unwrap_or("");
+                                            let is_buy = matches!(trade.side, polymarket_client_sdk::clob::types::Side::Buy);
+
+                                            info!("Trade {} - Status: {:?}, Side: {:?}, Outcome: {}, Size: {}",
+                                                trade.id, trade.status, trade.side, outcome, trade_size);
+
+                                            // Only process BUY trades that were mined (we bought tokens)
+                                            if is_buy && trade_size > 0.0 {
+                                                let mut state_guard = state.lock().await;
+                                                if let Some(mut s) = state_guard.clone() {
+                                                    let should_place_sell = if outcome.to_lowercase() == "up" {
+                                                        if !s.up_mined {
+                                                            s.up_mined = true;
+                                                            s.up_shares_received += trade_size;
+                                                            info!("Trade MINED: up_mined = true, shares_received = {}", s.up_shares_received);
+                                                            s.up_sell_order_id.is_none() // Place SELL if not already placed
+                                                        } else {
+                                                            // Additional fill for same side
+                                                            s.up_shares_received += trade_size;
+                                                            info!("Additional trade MINED for UP: total shares = {}", s.up_shares_received);
+                                                            false
+                                                        }
+                                                    } else if outcome.to_lowercase() == "down" {
+                                                        if !s.down_mined {
+                                                            s.down_mined = true;
+                                                            s.down_shares_received += trade_size;
+                                                            info!("Trade MINED: down_mined = true, shares_received = {}", s.down_shares_received);
+                                                            s.down_sell_order_id.is_none()
+                                                        } else {
+                                                            s.down_shares_received += trade_size;
+                                                            info!("Additional trade MINED for DOWN: total shares = {}", s.down_shares_received);
+                                                            false
+                                                        }
+                                                    } else {
+                                                        false
+                                                    };
+
+                                                    // Immediately place SELL order - event-driven, no polling!
+                                                    if should_place_sell && !config.strategy.simulation_mode {
+                                                        let (token_id, side_name, shares) = if outcome.to_lowercase() == "up" {
+                                                            (s.up_token_id.clone(), "UP", s.up_shares_received)
+                                                        } else {
+                                                            (s.down_token_id.clone(), "DOWN", s.down_shares_received)
+                                                        };
+
+                                                        info!("Placing SELL order immediately after MINED event for {} ({} shares)", side_name, shares);
+
+                                                        // Place SELL order at $0.50
+                                                        let order = OrderRequest {
+                                                            token_id: token_id.clone(),
+                                                            side: "SELL".to_string(),
+                                                            size: shares.to_string(),
+                                                            price: format!("{:.2}", SELL_PRICE),
+                                                            order_type: "LIMIT".to_string(),
+                                                        };
+
+                                                        match api.place_order(&order).await {
+                                                            Ok(sell_order) => {
+                                                                let order_id = sell_order.order_id.unwrap_or_default();
+                                                                if outcome.to_lowercase() == "up" {
+                                                                    s.up_sell_order_id = Some(order_id.clone());
+                                                                } else {
+                                                                    s.down_sell_order_id = Some(order_id.clone());
+                                                                }
+                                                                info!("SELL order placed successfully for {}: order_id={}", side_name, order_id);
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to place SELL order for {}: {}", side_name, e);
+                                                            }
+                                                        }
+                                                    } else if should_place_sell && config.strategy.simulation_mode {
+                                                        let side_name = if outcome.to_lowercase() == "up" { "UP" } else { "DOWN" };
+                                                        let shares = if outcome.to_lowercase() == "up" { s.up_shares_received } else { s.down_shares_received };
+                                                        info!("SIMULATION: Would place SELL order for {} ({} shares) at ${:.2}", side_name, shares, SELL_PRICE);
+                                                        let fake_order_id = format!("SIM-SELL-{}-{}", side_name, chrono::Utc::now().timestamp());
+                                                        if outcome.to_lowercase() == "up" {
+                                                            s.up_sell_order_id = Some(fake_order_id);
+                                                        } else {
+                                                            s.down_sell_order_id = Some(fake_order_id);
+                                                        }
+                                                    }
+
+                                                    *state_guard = Some(s);
+                                                }
+                                            }
+                                        }
+                                        TradeMessageStatus::Matched => {
+                                            // Trade matched but not yet on-chain - log but don't act
+                                            debug!("Trade {} matched, waiting for MINED status", trade.id);
+                                        }
+                                        _ => {
+                                            debug!("Trade {} has unknown status: {:?}", trade.id, trade.status);
+                                        }
+                                    }
+                                }
                                 _ => {
-                                    debug!("Received non-order user event");
+                                    debug!("Received other user event");
                                 }
                             }
                         }
@@ -299,7 +423,7 @@ impl PreLimitStrategy {
                 }
             }
         }
-        
+
         info!("CLOB subscription ended");
         Ok(())
     }
@@ -516,14 +640,18 @@ impl PreLimitStrategy {
     }
 
     fn cycle_trade_from_state(s: &PreLimitOrderState, shares: f64) -> CycleTrade {
+        // Use actual shares received if available, otherwise fall back to config shares
+        let up_shares = if s.up_shares_received > 0.0 { s.up_shares_received } else if s.up_mined { shares } else { 0.0 };
+        let down_shares = if s.down_shares_received > 0.0 { s.down_shares_received } else if s.down_mined { shares } else { 0.0 };
+
         CycleTrade {
             condition_id: s.condition_id.clone(),
             period_timestamp: s.market_period_start as u64,
             market_duration_secs: MARKET_DURATION_SECS_U64,
             up_token_id: Some(s.up_token_id.clone()),
             down_token_id: Some(s.down_token_id.clone()),
-            up_shares: if s.up_matched { shares } else { 0.0 },
-            down_shares: if s.down_matched { shares } else { 0.0 },
+            up_shares,
+            down_shares,
             up_avg_price: s.up_buy_price,
             down_avg_price: s.down_buy_price,
         }
