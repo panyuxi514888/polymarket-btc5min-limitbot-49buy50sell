@@ -83,8 +83,15 @@ pub struct PreLimitOrderState {
     pub down_order_id: Option<String>,
     pub up_buy_price: f64,
     pub down_buy_price: f64,
+    /// Order matched (CLOB matched, but NOT yet on-chain)
     pub up_matched: bool,
     pub down_matched: bool,
+    /// Trade mined on-chain (tokens are NOW in account - safe to place SELL)
+    pub up_mined: bool,
+    pub down_mined: bool,
+    /// Actual shares received (for partial fill handling)
+    pub up_shares_received: f64,
+    pub down_shares_received: f64,
     pub up_sell_order_id: Option<String>,
     pub down_sell_order_id: Option<String>,
     pub expiry: i64,
