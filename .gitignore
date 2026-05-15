@@ -1,0 +1,6 @@
+/target
+/btc5min.log
+*.log
+.env
+config.json
+.claude/
